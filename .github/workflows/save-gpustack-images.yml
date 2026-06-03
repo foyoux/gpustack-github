@@ -1,0 +1,208 @@
+name: Save GPUStack Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      dev:
+        description: "Whether to save dev images instead of release images (default: false)"
+        required: false
+        default: false
+        type: boolean
+      platform:
+        description: "Target Platform for the Images"
+        required: true
+        default: amd64
+        type: choice
+        options:
+          - amd64
+          - arm64
+      vllms:
+        description: "VLLM Image Tags, comma-separated"
+        required: false
+        type: string
+      sglangs:
+        description: "SGLang Image Tags, comma-separated"
+        required: false
+        type: string
+      runners:
+        description: "Runner Image Tags, comma-separated"
+        required: false
+        type: string
+      postgres:
+        description: "Postgres Image Tag"
+        required: true
+        default: "17.7"
+        type: string
+      prometheus:
+        description: "Prometheus Image Tag"
+        required: true
+        default: "v3.9.1"
+        type: string
+      grafana:
+        description: "Grafana Image Tag"
+        required: true
+        default: "12.3"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  save-images:
+    name: Save Images to OSS
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: 💾 Prepare Storage and Docker
+        shell: sudo bash {0}
+        run: |
+          mkfs.ext4 /dev/nvme0n1
+          mkdir -p /data/docker
+          mount /dev/nvme0n1 /data
+          mkdir -p /etc/docker
+          cat > /etc/docker/daemon.json << 'EOF'
+          {
+            "data-root": "/data/docker"
+          }
+          EOF
+          systemctl restart docker
+
+      - name: 🛠️ Setup OSS Utility
+        run: |
+          ARCH="$(uname -m)"
+          ARCH="${ARCH/aarch64/arm64}"
+          ARCH="${ARCH/x86_64/amd64}"
+          
+          curl -fsSLO https://gosspublic.alicdn.com/ossutil/v2/2.3.0/ossutil-2.3.0-linux-$ARCH.zip
+          unzip ossutil-2.3.0-linux-$ARCH.zip
+          rm ossutil-2.3.0-linux-$ARCH.zip
+          chmod 755 ossutil-2.3.0-linux-$ARCH/ossutil
+          sudo mv ossutil-2.3.0-linux-$ARCH/ossutil /usr/local/bin/
+          rmdir ossutil-2.3.0-linux-$ARCH
+          
+          cat > $HOME/.ossutilconfig << 'EOF'
+          [default]
+          accessKeyID=${{ secrets.OSS_ACCESS_KEY_ID }}
+          accessKeySecret=${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          region=${{ secrets.OSS_REGION }}
+          EOF
+
+      - name: 🔄 Process and Save Images
+        env:
+          OSS_BASE_URL: ${{ secrets.OSS_BASE_URL }}
+          DOCKER_SWR_REGISTRY: ${{ secrets.DOCKER_SWR_REGISTRY }}
+        run: |
+          TAG=dev
+          if [[ "${{ inputs.dev }}" != 'true' ]]; then
+            TAG=$(curl -s -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/gpustack/gpustack/releases?page=1&per_page=1" | grep '"tag_name":' | awk -F'"' '{print $4}')
+          fi
+          echo "🚀 Using GPUStack tag: $TAG"
+
+          IMAGE_LIST=$(
+            docker run -q --rm --entrypoint gpustack gpustack/gpustack:$TAG list-images \
+              | grep -v 'gpustack/runner:' \
+              | grep -v 'gpustack/runtime:health' || true
+          )
+
+          IMAGE_POOL=$(mktemp)
+
+          # 1. Parse base GPUStack images
+          echo "$IMAGE_LIST" | while read -r img; do
+            if [[ -n "$img" ]]; then
+              tmp=${img##*/}
+              name=${tmp%:*}
+              echo "$img|$name|$name" >> "$IMAGE_POOL"
+            fi
+          done
+
+          # 2. Process Runners -> Target OSS Folder: runner/
+          if [[ -n "${{ inputs.runners }}" ]]; then
+            echo "${{ inputs.runners }}" | tr ',' '\n' | while read -r tag; do
+              [[ -n "$tag" ]] && echo "gpustack/runner:$tag|:empty:|runner" >> "$IMAGE_POOL"
+            done
+          fi
+
+          # 3. Process VLLM -> Target OSS Folder: runner/
+          if [[ -n "${{ inputs.vllms }}" ]]; then
+            echo "${{ inputs.vllms }}" | tr ',' '\n' | while read -r tag; do
+              [[ -n "$tag" ]] && echo "vllm/vllm-openai:$tag|vllm-openai|runner" >> "$IMAGE_POOL"
+            done
+          fi
+
+          # 4. Process SGLang -> Target OSS Folder: runner/
+          if [[ -n "${{ inputs.sglangs }}" ]]; then
+            echo "${{ inputs.sglangs }}" | tr ',' '\n' | while read -r tag; do
+              [[ -n "$tag" ]] && echo "lmsysorg/sglang:$tag|sglang|runner" >> "$IMAGE_POOL"
+            done
+          fi
+
+          # 5. Process standalone components
+          [[ -n "${{ inputs.postgres }}" ]] && echo "postgres:${{ inputs.postgres }}|postgres|postgres" >> "$IMAGE_POOL"
+          [[ -n "${{ inputs.prometheus }}" ]] && echo "prom/prometheus:${{ inputs.prometheus }}|prometheus|prometheus" >> "$IMAGE_POOL"
+          [[ -n "${{ inputs.grafana }}" ]] && echo "grafana/grafana:${{ inputs.grafana }}|grafana|grafana" >> "$IMAGE_POOL"
+
+          echo "📋 Target Images to Process (Source | Short Name | OSS Folder):"
+          column -t -s '|' "$IMAGE_POOL"
+
+          # Initialize GitHub Actions Step Summary
+          echo "## 📦 Image Processing Summary (${{ inputs.platform }})" >> $GITHUB_STEP_SUMMARY
+          echo "| OSS Path | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+
+          # Execute Unified Pipeline
+          while IFS='|' read -r src_image short_name oss_folder; do
+            if [[ -z "$src_image" ]]; then continue; fi
+
+            echo "----------------------------------------"
+            echo "⏳ Processing: $src_image"
+
+            # Parse tag (extract substring after the last colon)
+            tag=${src_image##*:}
+
+            # Unified naming convention
+            tar="$short_name-$tag-${{ inputs.platform }}.tar"
+            tar="${tar/#:empty:-/}"
+            target_image="$DOCKER_SWR_REGISTRY/gpustack/$short_name:$tag"
+          
+            # Construct clear OSS path for summary
+            oss_path="$oss_folder/$tar"
+
+            # Check if file already exists in OSS
+            if ossutil stat "$OSS_BASE_URL/$oss_path" > /dev/null 2>&1; then
+              echo "⏭️  Skip: $tar already exists in OSS ($oss_folder/)."
+              echo "| \`$oss_path\` | ⏭️ Skipped (Exists) |" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            echo "⬇️  Pulling $src_image (platform: linux/${{ inputs.platform }})..."
+            if ! docker pull --platform linux/${{ inputs.platform }} -q "$src_image"; then
+              echo "❌ Error: Failed to pull $src_image"
+              echo "| \`$oss_path\` | ❌ Failed (Pull) |" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            echo "🏷️  Tagging as $target_image and saving to $tar..."
+            if ! docker tag "$src_image" "$target_image" || ! docker save -o "$tar" "$target_image"; then
+              echo "❌ Error: Failed to tag or save $src_image"
+              echo "| \`$oss_path\` | ❌ Failed (Save) |" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            echo "☁️  Uploading to OSS: $oss_folder/ ..."
+            if ! ossutil cp -q "$tar" "$OSS_BASE_URL/$oss_folder/" &> /dev/null; then
+              echo "❌ Error: Failed to upload $tar to OSS"
+              echo "| \`$oss_path\` | ❌ Failed (Upload) |" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
+            echo "✅ Success: $tar uploaded."
+            echo "| \`$oss_path\` | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+
+            echo "🧹 Cleaning up local cache..."
+            docker rmi "$src_image" "$target_image" &> /dev/null || true
+            rm -f "$tar"
+
+          done < "$IMAGE_POOL"
+
+          # Clean up temporary file
+          rm -f "$IMAGE_POOL"
