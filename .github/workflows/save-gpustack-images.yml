@@ -58,8 +58,8 @@ jobs:
         run: |
           mkfs.ext4 /dev/nvme0n1
           mkdir -p /data/docker
-          chmod a+rw /data
           mount /dev/nvme0n1 /data
+          chmod a+rw /data
           mkdir -p /etc/docker
           cat > /etc/docker/daemon.json << 'EOF'
           {
@@ -100,6 +100,7 @@ jobs:
           fi
           echo "🚀 Using GPUStack tag: $TAG"
 
+          echo "🔍 Fetching image list from gpustack/gpustack:$TAG..."
           IMAGE_LIST=$(
             docker run -q --rm --entrypoint gpustack gpustack/gpustack:$TAG list-images \
               | grep -v 'gpustack/runner:' \
