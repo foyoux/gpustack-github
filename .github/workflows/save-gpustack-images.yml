@@ -58,6 +58,7 @@ jobs:
         run: |
           mkfs.ext4 /dev/nvme0n1
           mkdir -p /data/docker
+          chmod a+rw /data
           mount /dev/nvme0n1 /data
           mkdir -p /etc/docker
           cat > /etc/docker/daemon.json << 'EOF'
@@ -88,6 +89,7 @@ jobs:
           EOF
 
       - name: 🔄 Process and Save Images
+        working-directory: /data
         env:
           OSS_BASE_URL: ${{ secrets.OSS_BASE_URL }}
           DOCKER_SWR_REGISTRY: ${{ secrets.DOCKER_SWR_REGISTRY }}
